@@ -17,6 +17,7 @@ rust-version = "1.87"
 # Ensure all dependencies + feats are mapped to crate features for correct usage
 # default features often have std breaking no_std and potentially other unwanted
 [dependencies]
+p521 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }
 aead = { version = "0.6", default-features = false }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.11", default-features = false }

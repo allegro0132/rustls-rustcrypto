@@ -267,3 +267,4 @@ mod misc;
 pub mod quic;
 pub mod sign;
 mod verify;
+pub use verify::GO_ALGORITHMS;
