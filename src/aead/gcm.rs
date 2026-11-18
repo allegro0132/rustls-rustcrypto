@@ -25,6 +25,74 @@ const TLS12_GCM_EXPLICIT_NONCE_LEN: usize = 8;
 #[cfg(feature = "tls12")]
 const TLS12_GCM_OVERHEAD: usize = TLS12_GCM_EXPLICIT_NONCE_LEN + 16;
 
+// Own the operation across scheduler polls; no borrowed record storage escapes.
+#[cfg(feature = "eip197-backend")]
+struct PendingGcm {
+    operation: Box<dyn aes_gcm::backend::Operation>,
+    typ: ContentType,
+    version: ProtocolVersion,
+    explicit: Option<[u8; 8]>,
+}
+
+#[cfg(feature = "eip197-backend")]
+struct GcmOutput(aes_gcm::backend::Output);
+#[cfg(feature = "eip197-backend")]
+impl AsRef<[u8]> for GcmOutput {fn as_ref(&self)->&[u8]{self.0.as_ref()}}
+#[cfg(feature = "eip197-backend")]
+impl AsMut<[u8]> for GcmOutput {fn as_mut(&mut self)->&mut [u8]{self.0.as_mut()}}
+#[cfg(feature = "eip197-backend")]
+impl cipher::PayloadBuffer for GcmOutput {}
+
+#[cfg(feature = "eip197-backend")]
+impl cipher::PendingEncryption for PendingGcm {
+    fn poll(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Result<OutboundOpaqueMessage, rustls::Error>> {
+        use core::task::Poll;
+        match self.operation.poll_output(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => Poll::Ready(Err(rustls::Error::EncryptError)),
+            Poll::Ready(Ok((mut data, tag))) => {
+                if let Some(explicit)=self.explicit { data.prepend(&explicit); }
+                data.append(&tag);
+                data.prepend(&[0;5]);
+                Poll::Ready(PrefixedPayload::from_buffer(Box::new(GcmOutput(data)))
+                    .map(|payload|OutboundOpaqueMessage::new(self.typ,self.version,payload)))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "eip197-backend")]
+struct PendingGcmDecryption {
+    operation: Option<Box<dyn aes_gcm::backend::Operation>>,
+    typ: ContentType,
+    version: ProtocolVersion,
+    tls13: bool,
+}
+#[cfg(feature = "eip197-backend")]
+impl cipher::PendingDecryption for PendingGcmDecryption {
+    fn poll(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Result<cipher::OwnedPlaintext, rustls::Error>> {
+        use core::task::Poll;
+        let Some(operation) = self.operation.as_mut() else { return Poll::Ready(Err(rustls::Error::DecryptError)); };
+        let result = match operation.poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(result) => result,
+        };
+        self.operation = None;
+        Poll::Ready(result.map_err(|_|rustls::Error::DecryptError).and_then(|(data,_)| {
+            let mut plain = cipher::OwnedPlaintext { typ:self.typ, version:self.version, payload:data };
+            if self.tls13 {
+                let (typ,version,len) = {
+                    let message = InboundOpaqueMessage::new(plain.typ,plain.version,&mut plain.payload)
+                        .into_tls13_unpadded_message()?;
+                    (message.typ,message.version,message.payload.len())
+                };
+                plain.typ=typ; plain.version=version; plain.payload.truncate(len);
+            }
+            Ok(plain)
+        }))
+    }
+}
+
 macro_rules! impl_gcm_tls13 {
     ($name: ident, $aead: ty, $overhead: expr) => {
         paste! {
@@ -60,6 +128,20 @@ macro_rules! impl_gcm_tls13 {
             struct [<Tls13Cipher $name>]($aead, cipher::Iv);
 
             impl MessageEncrypter for [<Tls13Cipher $name>] {
+                #[cfg(feature = "eip197-backend")]
+                fn start_encrypt(&mut self, m: OutboundPlainMessage<'_>, seq: u64) -> Box<dyn cipher::PendingEncryption> {
+                    let nonce = cipher::Nonce::new(&self.1, seq).0;
+                    let aad = cipher::make_tls13_aad(self.encrypted_payload_len(m.payload.len()));
+                    let mut data = alloc::vec::Vec::with_capacity(m.payload.len() + 22);
+                    m.payload.copy_to_vec(&mut data);
+                    data.extend_from_slice(&m.typ.to_array());
+                    Box::new(PendingGcm {
+                        operation: self.0.start_encrypt_owned(nonce, aad.to_vec(), data),
+                        typ: ContentType::ApplicationData,
+                        version: ProtocolVersion::TLSv1_2,
+                        explicit: None,
+                    })
+                }
                 fn encrypt(&mut self, m: OutboundPlainMessage<'_>, seq: u64) -> Result<OutboundOpaqueMessage, rustls::Error> {
                     let total_len = self.encrypted_payload_len(m.payload.len());
                     let mut payload = PrefixedPayload::with_capacity(total_len);
@@ -85,6 +167,16 @@ macro_rules! impl_gcm_tls13 {
             }
 
             impl MessageDecrypter for [<Tls13Cipher $name>] {
+                #[cfg(feature = "eip197-backend")]
+                fn start_decrypt(&mut self, m: InboundOpaqueMessage<'_>, seq: u64) -> Box<dyn cipher::PendingDecryption> {
+                    let operation = if m.payload.len() < 16 { None } else {
+                        let split = m.payload.len() - 16;
+                        let tag = m.payload[split..].try_into().unwrap();
+                        Some(self.0.start_decrypt_owned(cipher::Nonce::new(&self.1,seq).0,
+                            cipher::make_tls13_aad(m.payload.len()).to_vec(),m.payload[..split].to_vec(),tag))
+                    };
+                    Box::new(PendingGcmDecryption {operation,typ:m.typ,version:m.version,tls13:true})
+                }
                 fn decrypt<'a>(&mut self, mut m: InboundOpaqueMessage<'a>, seq: u64) -> Result<InboundPlainMessage<'a>, rustls::Error> {
                     let payload = &mut m.payload;
                     let nonce = cipher::Nonce::new(&self.1, seq).0;
@@ -156,6 +248,19 @@ macro_rules! impl_gcm_tls12 {
 
             #[cfg(feature = "tls12")]
             impl MessageEncrypter for [<Tls12Cipher $name Encrypter>] {
+                #[cfg(feature = "eip197-backend")]
+                fn start_encrypt(&mut self, m: OutboundPlainMessage<'_>, seq: u64) -> Box<dyn cipher::PendingEncryption> {
+                    let nonce = cipher::Nonce::new(&self.1.into(), seq).0;
+                    let aad = cipher::make_tls12_aad(seq, m.typ, m.version, m.payload.len());
+                    let mut data = alloc::vec::Vec::with_capacity(m.payload.len() + 29);
+                    m.payload.copy_to_vec(&mut data);
+                    Box::new(PendingGcm {
+                        operation: self.0.start_encrypt_owned(nonce, aad.to_vec(), data),
+                        typ: m.typ,
+                        version: m.version,
+                        explicit: Some(nonce[4..].try_into().unwrap()),
+                    })
+                }
                 fn encrypt(&mut self, m: OutboundPlainMessage<'_>, seq: u64) -> Result<OutboundOpaqueMessage, rustls::Error> {
                     let total_len = self.encrypted_payload_len(m.payload.len());
                     let mut payload = PrefixedPayload::with_capacity(total_len);
@@ -181,6 +286,20 @@ macro_rules! impl_gcm_tls12 {
 
             #[cfg(feature = "tls12")]
             impl MessageDecrypter for [<Tls12Cipher $name Decrypter>] {
+                #[cfg(feature = "eip197-backend")]
+                fn start_decrypt(&mut self, m: InboundOpaqueMessage<'_>, seq: u64) -> Box<dyn cipher::PendingDecryption> {
+                    let operation = if m.payload.len() < $overhead { None } else {
+                        let split = m.payload.len() - 16;
+                        let tag = m.payload[split..].try_into().unwrap();
+                        let mut nonce = [0;12];
+                        nonce[..4].copy_from_slice(&self.1);
+                        nonce[4..].copy_from_slice(&m.payload[..$nonce]);
+                        Some(self.0.start_decrypt_owned(nonce,
+                            cipher::make_tls12_aad(seq,m.typ,m.version,m.payload.len()-$overhead).to_vec(),
+                            m.payload[$nonce..split].to_vec(),tag))
+                    };
+                    Box::new(PendingGcmDecryption {operation,typ:m.typ,version:m.version,tls13:false})
+                }
                 fn decrypt<'a>(&mut self, mut m: InboundOpaqueMessage<'a>, seq: u64) -> Result<InboundPlainMessage<'a>, rustls::Error> {
                     type TagSize = <$aead as AeadCore>::TagSize;
 
