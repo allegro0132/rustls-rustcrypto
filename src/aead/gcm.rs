@@ -190,8 +190,8 @@ macro_rules! impl_gcm_tls13 {
                     let operation = if m.payload.len() < 16 { None } else {
                         let split = m.payload.len() - 16;
                         let tag = m.payload[split..].try_into().unwrap();
-                        Some(self.0.start_decrypt_owned(cipher::Nonce::new(&self.1,seq).0,
-                            cipher::make_tls13_aad(m.payload.len()).to_vec(),m.payload[..split].to_vec(),tag))
+                        Some(self.0.start_decrypt_slice(cipher::Nonce::new(&self.1,seq).0,
+                            &cipher::make_tls13_aad(m.payload.len()),&m.payload[..split],tag))
                     };
                     Box::new(PendingGcmDecryption {operation,typ:m.typ,version:m.version,tls13:true})
                 }
@@ -312,9 +312,9 @@ macro_rules! impl_gcm_tls12 {
                         let mut nonce = [0;12];
                         nonce[..4].copy_from_slice(&self.1);
                         nonce[4..].copy_from_slice(&m.payload[..$nonce]);
-                        Some(self.0.start_decrypt_owned(nonce,
-                            cipher::make_tls12_aad(seq,m.typ,m.version,m.payload.len()-$overhead).to_vec(),
-                            m.payload[$nonce..split].to_vec(),tag))
+                        Some(self.0.start_decrypt_slice(nonce,
+                            &cipher::make_tls12_aad(seq,m.typ,m.version,m.payload.len()-$overhead),
+                            &m.payload[$nonce..split],tag))
                     };
                     Box::new(PendingGcmDecryption {operation,typ:m.typ,version:m.version,tls13:false})
                 }
