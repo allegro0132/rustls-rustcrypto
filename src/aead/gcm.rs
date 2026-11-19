@@ -70,6 +70,24 @@ struct PendingGcmDecryption {
 }
 #[cfg(feature = "eip197-backend")]
 impl cipher::PendingDecryption for PendingGcmDecryption {
+    fn poll_into(&mut self, cx: &mut core::task::Context<'_>, dst: &mut [u8])
+        -> core::task::Poll<Result<(ContentType, ProtocolVersion, usize), rustls::Error>> {
+        use core::task::{ready, Poll};
+        let operation = self.operation.as_mut().ok_or(rustls::Error::DecryptError)?;
+        let result = ready!(operation.poll_output(cx));
+        self.operation = None;
+        let (mut data, _) = result.map_err(|_| rustls::Error::DecryptError)?;
+        let (typ, version, len) = if self.tls13 {
+            let plain = InboundOpaqueMessage::new(self.typ, self.version, data.as_mut())
+                .into_tls13_unpadded_message()?;
+            (plain.typ, plain.version, plain.payload.len())
+        } else {
+            (self.typ, self.version, data.as_ref().len())
+        };
+        let out = dst.get_mut(..len).ok_or(rustls::Error::DecryptError)?;
+        data.copy_prefix_to(out).map_err(|_| rustls::Error::DecryptError)?;
+        Poll::Ready(Ok((typ, version, len)))
+    }
     fn poll(&mut self, cx: &mut core::task::Context<'_>) -> core::task::Poll<Result<cipher::OwnedPlaintext, rustls::Error>> {
         use core::task::Poll;
         let Some(operation) = self.operation.as_mut() else { return Poll::Ready(Err(rustls::Error::DecryptError)); };
