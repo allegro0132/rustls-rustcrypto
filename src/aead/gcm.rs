@@ -150,11 +150,19 @@ macro_rules! impl_gcm_tls13 {
                 fn start_encrypt(&mut self, m: OutboundPlainMessage<'_>, seq: u64) -> Box<dyn cipher::PendingEncryption> {
                     let nonce = cipher::Nonce::new(&self.1, seq).0;
                     let aad = cipher::make_tls13_aad(self.encrypted_payload_len(m.payload.len()));
-                    let mut data = alloc::vec::Vec::with_capacity(m.payload.len() + 22);
-                    m.payload.copy_to_vec(&mut data);
-                    data.extend_from_slice(&m.typ.to_array());
+                    let trailer = m.typ.to_array();
+                    let direct = match &m.payload {
+                        cipher::OutboundChunks::Single(data) => self.0.try_encrypt_slices(&nonce, &aad, data, &trailer),
+                        _ => None,
+                    };
+                    let operation = direct.unwrap_or_else(|| {
+                        let mut data = alloc::vec::Vec::with_capacity(m.payload.len() + 22);
+                        m.payload.copy_to_vec(&mut data);
+                        data.extend_from_slice(&trailer);
+                        self.0.start_encrypt_owned(nonce, aad.to_vec(), data)
+                    });
                     Box::new(PendingGcm {
-                        operation: self.0.start_encrypt_owned(nonce, aad.to_vec(), data),
+                        operation,
                         typ: ContentType::ApplicationData,
                         version: ProtocolVersion::TLSv1_2,
                         explicit: None,
