@@ -41,6 +41,7 @@ signature = { version = "3", default-features = false }
 x25519-dalek = { version = "3", default-features = false }
 
 [features]
+owned-record-rx = ["alloc", "aes-gcm/eip197-backend"]
 eip197-backend = ["aes-gcm/eip197-backend"]
 default = ["std", "tls12", "zeroize"]
 logging = ["rustls/logging"]

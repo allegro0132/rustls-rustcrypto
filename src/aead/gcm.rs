@@ -193,6 +193,35 @@ macro_rules! impl_gcm_tls13 {
             }
 
             impl MessageDecrypter for [<Tls13Cipher $name>] {
+                #[cfg(feature = "owned-record-rx")]
+                fn decrypt_owned_record(&mut self, msg: &InboundOpaqueMessage<'_>, seq: u64)
+                    -> Option<Result<cipher::OwnedPlaintext, rustls::Error>> {
+                    Some((|| {
+                        let split = msg.payload.len().checked_sub(16).ok_or(rustls::Error::DecryptError)?;
+                        let (input, tag) = msg.payload.split_at(split);
+                        let tag = aes_gcm::Tag::try_from(tag).map_err(|_| rustls::Error::DecryptError)?;
+                        let nonce = cipher::Nonce::new(&self.1, seq).0;
+                        let aad = cipher::make_tls13_aad(msg.payload.len());
+                        let mut plain = cipher::OwnedPlaintext { typ: msg.typ, version: msg.version, payload: alloc::vec::Vec::new() };
+                        match self.0.try_open_owned(&nonce, &aad, input, tag.as_ref()) {
+                            Some(result) => plain.payload = result.map_err(|_| rustls::Error::DecryptError)?,
+                            None => {
+                                plain.payload.resize(split, 0);
+                                self.0.decrypt_inout_detached(&nonce.into(), &aad,
+                                    aead::inout::InOutBuf::new(input, &mut plain.payload).map_err(|_| rustls::Error::DecryptError)?, &tag)
+                                    .map_err(|_| rustls::Error::DecryptError)?;
+                            }
+                        }
+                        if plain.payload.len() != split { return Err(rustls::Error::DecryptError); }
+                        let result = InboundOpaqueMessage::new(msg.typ, msg.version, &mut plain.payload)
+                            .into_tls13_unpadded_message()?;
+                        let len = result.payload.len();
+                        plain.typ = result.typ;
+                        plain.version = result.version;
+                        plain.payload.truncate(len);
+                        Ok(plain)
+                    })())
+                }
                 #[cfg(feature = "eip197-backend")]
                 fn start_decrypt(&mut self, m: InboundOpaqueMessage<'_>, seq: u64) -> Box<dyn cipher::PendingDecryption> {
                     let operation = if m.payload.len() < 16 { None } else {
